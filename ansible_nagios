@@ -1,0 +1,264 @@
+---
+- name: Install and Configure Nagios Monitoring Server
+  hosts: master
+  become: yes
+  vars:
+    nagios_version: "4.5.7"
+    nagios_plugins_version: "2.4.12"
+    nrpe_version: "4.1.3"
+    nagios_admin_user: "nagiosadmin"
+    nagios_admin_password: "1"
+    client_address: "172.31.14.208"   # <-- replace with your slave IP
+
+  tasks:
+    - name: Update and upgrade system packages
+      apt:
+        update_cache: yes
+        upgrade: dist
+
+    - name: Install dependencies for Nagios Core
+      apt:
+        name:
+          - autoconf
+          - gcc
+          - libc6
+          - make
+          - wget
+          - unzip
+          - apache2
+          - php
+          - libapache2-mod-php
+          - libgd-dev
+          - openssl
+          - libssl-dev
+        state: present
+
+    - name: Create working directory
+      file:
+        path: /tmp/nagios-core
+        state: directory
+
+    - name: Download Nagios Core
+      get_url:
+        url: "https://github.com/NagiosEnterprises/nagioscore/archive/nagios-{{ nagios_version }}.tar.gz"
+        dest: "/tmp/nagios-core/nagioscore.tar.gz"
+
+    - name: Extract Nagios Core
+      unarchive:
+        src: "/tmp/nagios-core/nagioscore.tar.gz"
+        dest: "/tmp/nagios-core/"
+        remote_src: yes
+
+    - name: Compile and install Nagios Core
+      shell: |
+        cd /tmp/nagios-core/nagioscore-nagios-{{ nagios_version }}
+        ./configure --with-httpd-conf=/etc/apache2/sites-enabled
+        make all
+        make install-groups-users
+        usermod -a -G nagios www-data
+        make install
+        make install-daemoninit
+        make install-commandmode
+        make install-config
+        make install-webconf
+      args:
+        creates: /usr/local/nagios/bin/nagios
+
+    - name: Enable Apache modules
+      apache2_module:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - rewrite
+        - cgi
+
+    - name: Create Nagios web admin user
+      community.general.htpasswd:
+        path: /usr/local/nagios/etc/htpasswd.users
+        name: "{{ nagios_admin_user }}"
+        password: "{{ nagios_admin_password }}"
+        crypt_scheme: bcrypt
+
+    - name: Restart Apache
+      service:
+        name: apache2
+        state: restarted
+        enabled: yes
+
+    - name: Install dependencies for Nagios Plugins
+      apt:
+        name:
+          - autoconf
+          - gcc
+          - libc6
+          - libmcrypt-dev
+          - make
+          - libssl-dev
+          - wget
+          - bc
+          - gawk
+          - dc
+          - build-essential
+          - snmp
+          - libnet-snmp-perl
+          - gettext
+        state: present
+
+    - name: Download Nagios Plugins
+      get_url:
+        url: "https://github.com/nagios-plugins/nagios-plugins/archive/release-{{ nagios_plugins_version }}.tar.gz"
+        dest: "/tmp/nagios-plugins.tar.gz"
+
+    - name: Extract and install Nagios Plugins
+      shell: |
+        cd /tmp
+        tar zxf nagios-plugins.tar.gz
+        cd nagios-plugins-release-{{ nagios_plugins_version }}
+        ./tools/setup
+        ./configure
+        make && make install
+      args:
+        creates: /usr/local/nagios/libexec/check_ping
+
+    - name: Download and install NRPE check plugin
+      shell: |
+        cd /tmp
+        wget -O nrpe.tar.gz https://github.com/NagiosEnterprises/nrpe/releases/download/nrpe-{{ nrpe_version }}/nrpe-{{ nrpe_version }}.tar.gz
+        tar xzf nrpe.tar.gz
+        cd nrpe-{{ nrpe_version }}
+        ./configure
+        make check_nrpe
+        make install-plugin
+      args:
+        creates: /usr/local/nagios/libexec/check_nrpe
+
+    - name: Configure NRPE command in Nagios
+      copy:
+        dest: /usr/local/nagios/etc/objects/commands.cfg
+        content: |
+          define command {
+              command_name    check_nrpe
+              command_line    /usr/local/nagios/libexec/check_nrpe -H $HOSTADDRESS$ 
+          }
+
+    - name: Create directory for client configs
+      file:
+        path: /usr/local/nagios/etc/servers
+        state: directory
+        owner: nagios
+        group: nagios
+        mode: '0755'
+
+    - name: Add client host configuration
+      copy:
+        dest: /usr/local/nagios/etc/servers/client.cfg
+        content: |
+          define host {
+              use                 linux-server
+              host_name           ubuntu-client
+              alias               Ubuntu Client Server
+              address             {{ client_address }}
+              max_check_attempts  5
+              check_period        24x7
+              notification_interval 30
+              notification_period 24x7
+          }
+
+          define service {
+              use                 generic-service
+              host_name           ubuntu-client
+              service_description Check Disk
+              check_command       check_nrpe!check_disk
+          }
+
+          define service {
+              use                 generic-service
+              host_name           ubuntu-client
+              service_description Check Load
+              check_command       check_nrpe!check_load
+          }
+
+          define service {
+              use                 generic-service
+              host_name           ubuntu-client
+              service_description Check Memory
+              check_command       check_nrpe!check_mem
+          }
+
+    - name: Add servers directory to Nagios main config
+      lineinfile:
+        path: /usr/local/nagios/etc/nagios.cfg
+        line: "cfg_dir=/usr/local/nagios/etc/servers"
+        insertafter: EOF
+
+    - name: Verify Nagios configuration
+      command: /usr/local/nagios/bin/nagios -v /usr/local/nagios/etc/nagios.cfg
+
+    - name: Enable and start Nagios service
+      service:
+        name: nagios
+        state: started
+        enabled: yes
+
+    - name: Configure firewall
+      block:
+        - name: Allow SSH and HTTP
+          ufw:
+            rule: allow
+            port: "{{ item }}"
+            proto: tcp
+          loop:
+            - 22
+            - 80
+        - name: Enable UFW
+          ufw:
+            state: enabled
+            policy: allow
+
+    - name: Display success message
+      debug:
+        msg: "✅ Nagios installation and configuration completed successfully on Master 13.214.189.253"
+
+
+#client side code
+---
+- name: Configure Nagios Client (NRPE + Plugins)
+  hosts: clients
+  become: yes
+
+  vars:
+    nagios_master_ip: "13.214.189.253"  # Replace with your Master IP
+
+  tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+
+    - name: Install NRPE and Nagios plugins
+      apt:
+        name:
+          - nagios-nrpe-server
+          - nagios-plugins
+        state: present
+
+    - name: Configure allowed hosts in NRPE
+      lineinfile:
+        path: /etc/nagios/nrpe.cfg
+        regexp: '^allowed_hosts='
+        line: "allowed_hosts=127.0.0.1,{{ nagios_master_ip }}"
+        backup: yes
+
+    - name: Enable and start NRPE service
+      service:
+        name: nagios-nrpe-server
+        state: started
+        enabled: yes
+
+    - name: Verify NRPE is running
+      command: systemctl status nagios-nrpe-server
+      register: nrpe_status
+      ignore_errors: yes
+
+    - debug:
+        msg: "NRPE service status: {{ nrpe_status.stdout_lines }}"
+
